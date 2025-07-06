@@ -56,6 +56,35 @@ func makeInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
 	}
 }
 
+// constantInputSource creates an input source function that always returns the
+// static set of user-selected UTXOs.
+func constantInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
+	// Current inputs and their total value. These won't change over
+	// different invocations as we want our inputs to remain static since
+	// they're selected by the user.
+	currentTotal := ltcutil.Amount(0)
+	currentInputs := make([]*wire.TxIn, 0, len(eligible))
+	currentScripts := make([][]byte, 0, len(eligible))
+	currentInputValues := make([]ltcutil.Amount, 0, len(eligible))
+	currentMwebOutputs := make([]*wire.MwebOutput, 0, len(eligible))
+
+	for _, credit := range eligible {
+		nextInput := wire.NewTxIn(&credit.OutPoint, nil, nil)
+		currentTotal += credit.Amount
+		currentInputs = append(currentInputs, nextInput)
+		currentScripts = append(currentScripts, credit.PkScript)
+		currentInputValues = append(currentInputValues, credit.Amount)
+		currentMwebOutputs = append(currentMwebOutputs, credit.MwebOutput)
+	}
+
+	return func(target ltcutil.Amount) (ltcutil.Amount, []*wire.TxIn,
+		[]ltcutil.Amount, [][]byte, []*wire.MwebOutput, error) {
+
+		return currentTotal, currentInputs, currentInputValues,
+			currentScripts, currentMwebOutputs, nil
+	}
+}
+
 // secretSource is an implementation of txauthor.SecretSource for the wallet's
 // address manager.
 type secretSource struct {
@@ -124,8 +153,8 @@ func (s secretSource) GetScanKey(addr ltcutil.Address) (*btcec.PrivateKey, error
 func (w *Wallet) txToOutputs(outputs []*wire.TxOut,
 	coinSelectKeyScope, changeKeyScope *waddrmgr.KeyScope,
 	account uint32, minconf int32, feeSatPerKb ltcutil.Amount,
-	coinSelectionStrategy CoinSelectionStrategy, dryRun bool) (
-	*txauthor.AuthoredTx, error) {
+	coinSelectionStrategy CoinSelectionStrategy, dryRun bool,
+	selectedUtxos []wire.OutPoint) (*txauthor.AuthoredTx, error) {
 
 	chainClient, err := w.requireChainClient()
 	if err != nil {
@@ -140,6 +169,51 @@ func (w *Wallet) txToOutputs(outputs []*wire.TxOut,
 
 	var tx *txauthor.AuthoredTx
 	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
+		// When specific UTXOs are selected, determine if they are MWEB type
+		// and set the change scope accordingly.
+		// input MWEB -> change MWEB
+		// input canonical -> change P2WKH
+		if len(selectedUtxos) > 0 && changeKeyScope == nil {
+			txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+			if txmgrNs == nil {
+				return fmt.Errorf("wtxmgrNamespaceKey bucket is nil")
+			}
+
+			unspent, err := w.TxStore.UnspentOutputs(txmgrNs)
+			if err != nil {
+				return err
+			}
+
+			// Create a map to find the selected UTXOs
+			selectedMap := make(map[wire.OutPoint]struct{})
+			for _, outpoint := range selectedUtxos {
+				selectedMap[outpoint] = struct{}{}
+			}
+
+			// Check if any selected UTXO is MWEB type
+			mwebSelected := false
+			matchCount := 0
+			for _, output := range unspent {
+				if _, ok := selectedMap[output.OutPoint]; ok {
+					matchCount++
+					if txscript.IsMweb(output.PkScript) {
+						mwebSelected = true
+						break
+					}
+				}
+			}
+
+			// If selected UTXOs contain MWEB type, set change scope to MWEB
+			if mwebSelected {
+				mwebScope := waddrmgr.KeyScopeMweb
+				changeKeyScope = &mwebScope
+			} else {
+				// Otherwise use P2WKH for canonical type
+				p2wkhScope := waddrmgr.KeyScopeBIP0084
+				changeKeyScope = &p2wkhScope
+			}
+		}
+
 		addrmgrNs, changeSource, err := w.addrMgrWithChangeSource(
 			dbtx, changeKeyScope, account,
 		)
@@ -152,6 +226,34 @@ func (w *Wallet) txToOutputs(outputs []*wire.TxOut,
 		)
 		if err != nil {
 			return err
+		}
+
+		// check if specific UTXOs were selected by the user
+		// LTC: our behaviour is slightly different from upstream
+		if len(selectedUtxos) > 0 {
+			eligibleByOutpoint := make(
+				map[wire.OutPoint]wtxmgr.Credit,
+			)
+
+			for _, e := range eligible {
+				eligibleByOutpoint[e.OutPoint] = e
+			}
+
+			// Create a new eligible list with only the selected UTXOs
+			var filteredEligible []wtxmgr.Credit
+			for _, outpoint := range selectedUtxos {
+				e, ok := eligibleByOutpoint[outpoint]
+
+				if !ok {
+					return fmt.Errorf("selected outpoint "+
+						"not eligible for "+
+						"spending: %v", outpoint)
+				}
+				filteredEligible = append(filteredEligible, e)
+			}
+
+			// replace the full eligible list with just the selected UTXOs
+			eligible = filteredEligible
 		}
 
 		allCanonical, allMweb := true, true

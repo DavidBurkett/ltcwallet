@@ -1217,6 +1217,7 @@ type (
 		coinSelectionStrategy CoinSelectionStrategy
 		dryRun                bool
 		resp                  chan createTxResponse
+		selectUtxos           []wire.OutPoint
 	}
 	createTxResponse struct {
 		tx  *txauthor.AuthoredTx
@@ -1257,7 +1258,7 @@ out:
 			tx, err := w.txToOutputs(
 				txr.outputs, txr.coinSelectKeyScope, txr.changeKeyScope,
 				txr.account, txr.minconf, txr.feeSatPerKB,
-				txr.coinSelectionStrategy, txr.dryRun,
+				txr.coinSelectionStrategy, txr.dryRun, txr.selectUtxos,
 			)
 
 			release()
@@ -1274,6 +1275,7 @@ out:
 // scope, which otherwise will default to the specified coin selection scope.
 type txCreateOptions struct {
 	changeKeyScope *waddrmgr.KeyScope
+	selectUtxos    []wire.OutPoint
 }
 
 // TxCreateOption is a set of optional arguments to modify the tx creation
@@ -1293,6 +1295,14 @@ func defaultTxCreateOptions() *txCreateOptions {
 func WithCustomChangeScope(changeScope *waddrmgr.KeyScope) TxCreateOption {
 	return func(opts *txCreateOptions) {
 		opts.changeKeyScope = changeScope
+	}
+}
+
+// WithCustomSelectUtxos is used to specify the inputs to be used while
+// creating txns.
+func WithCustomSelectUtxos(utxos []wire.OutPoint) TxCreateOption {
+	return func(opts *txCreateOptions) {
+		opts.selectUtxos = utxos
 	}
 }
 
@@ -1339,6 +1349,7 @@ func (w *Wallet) CreateSimpleTx(coinSelectKeyScope *waddrmgr.KeyScope,
 		coinSelectionStrategy: coinSelectionStrategy,
 		dryRun:                dryRun,
 		resp:                  make(chan createTxResponse),
+		selectUtxos:           opts.selectUtxos,
 	}
 	w.createTxRequests <- req
 	resp := <-req.resp
@@ -3404,6 +3415,31 @@ func (w *Wallet) SendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope,
 	coinSelectionStrategy CoinSelectionStrategy, label string) (
 	*wire.MsgTx, error) {
 
+	return w.sendOutputs(
+		outputs, keyScope, account, minconf, satPerKb,
+		coinSelectionStrategy, label,
+	)
+}
+
+// SendOutputsWithInput creates and sends payment transactions using the
+// provided selected utxos. It returns the transaction upon success.
+func (w *Wallet) SendOutputsWithInput(outputs []*wire.TxOut,
+	keyScope *waddrmgr.KeyScope,
+	account uint32, minconf int32, satPerKb ltcutil.Amount,
+	coinSelectionStrategy CoinSelectionStrategy, label string,
+	selectedUtxos []wire.OutPoint) (*wire.MsgTx, error) {
+
+	return w.sendOutputs(outputs, keyScope, account, minconf, satPerKb,
+		coinSelectionStrategy, label, selectedUtxos...)
+}
+
+// sendOutputs creates and sends payment transactions. It returns the
+// transaction upon success.
+func (w *Wallet) sendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope,
+	account uint32, minconf int32, satPerKb ltcutil.Amount,
+	coinSelectionStrategy CoinSelectionStrategy, label string,
+	selectedUtxos ...wire.OutPoint) (*wire.MsgTx, error) {
+
 	// Ensure the outputs to be created adhere to the network's consensus
 	// rules.
 	for _, output := range outputs {
@@ -3421,7 +3457,9 @@ func (w *Wallet) SendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope,
 	// been confirmed.
 	createdTx, err := w.CreateSimpleTx(
 		keyScope, account, outputs, minconf, satPerKb,
-		coinSelectionStrategy, false,
+		coinSelectionStrategy, false, WithCustomSelectUtxos(
+			selectedUtxos,
+		),
 	)
 	if err != nil {
 		return nil, err
